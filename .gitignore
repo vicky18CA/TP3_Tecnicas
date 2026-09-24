@@ -1,0 +1,11 @@
+# ESP-IDF build directory
+build/
+sdkconfig.old
+
+# Archivos de configuración local de VS Code
+.vscode/
+.clangd/
+
+# Archivos temporales de Linux / editores
+*~
+*.swp
