@@ -30,6 +30,8 @@
 #define BAUD_RATE 9600
 #define RX_BUFFER_SIZE 256
 
+// Tamaño máximo de una trama Modbus
+#define MODBUS_FRAME_SIZE 256
 
 //Definición de los esclavos
 
@@ -39,6 +41,24 @@
 //en este caso haremos que la trama de modbus sea para leer los HOlding Registers
 
 #define FC_READ_HOLDING_REGISTERS 0x03 
+
+// Estructura para almacenar una trama recibida
+typedef struct
+{
+    uint8_t data[MODBUS_FRAME_SIZE];
+    uint16_t length;
+
+} modbus_frame_t;
+
+// Cola para pasar las tramas desde UART RX hacia la tarea Modbus
+static QueueHandle_t modbus_queue;
+
+
+// Semáforo para avisar que llegó una respuesta
+static SemaphoreHandle_t response_semaphore;
+
+
+
 
 //la trama de modbus tiene una parte de CRC que es para ver un bug que se haya realizado en un esclavo, son los últimos 2 bytes. Recordar que si el esclavo me duvuelve los mismos 2 bytes que yo le mandé, eso quiere decir que no hay error, pero si no cioncide (generalmente el esclavo pone el bit más significativo en 1) signofoca que hay un error 
 
@@ -67,6 +87,10 @@ uint16_t modbus_crc16(const uint8_t *data, uint16_t lenght) // recibe un puntero
     return crc; // y todo esto es para calcular CRC :)
 
 }
+
+
+
+
 
 /*Acá inicializamos la UART y la RS485*/
 
@@ -107,7 +131,7 @@ void rs485_init(void)
         )
     );
 
-    //configuramos los pines a gpio de propósito general
+    //configuramos los pines a gpio de propósito general para el MAX485
 
     gpio_config_t io_conf = {
         .pin_bit_mask = (1ULL << MAESTRO_UART_RTS),
@@ -146,6 +170,140 @@ void rs485_send(const uint8_t *data, size_t length)
     gpio_set_level(MAESTRO_UART_RTS, 0);
 }
 
+
+//Para la transmisión del RS485 
+
+void rs485_send(const uint8_t *data, size_t length)
+{
+    // --------------------------------------------------
+    // 1. Activar transmisión del MAX485
+    // --------------------------------------------------
+
+    gpio_set_level(MAESTRO_UART_RTS, 1);
+
+
+    // --------------------------------------------------
+    // 2. Enviar los bytes
+    // --------------------------------------------------
+
+    uart_write_bytes(
+        PORT_MAESTRO,
+        (const char *)data,
+        length
+    );
+
+
+    // --------------------------------------------------
+    // 3. Esperar que termine la transmisión
+    // --------------------------------------------------
+
+    uart_wait_tx_done(
+        PORT_MAESTRO,
+        pdMS_TO_TICKS(100)
+    );
+
+
+    // --------------------------------------------------
+    // 4. Volver a recepción
+    // --------------------------------------------------
+
+    gpio_set_level(MAESTRO_UART_RTS, 0);
+}
+
+/*Para agregar más cosas al TP, voy a agregar una tarea para la recepción de UART, como hizo Gonza*/
+
+void recepcion_UART(void *pvParameters)
+{
+    uint8_t rx_buffer[MODBUS_FRAME_SIZE];
+
+    while (1)
+    {
+        // --------------------------------------------------
+        // Indicamos la cantidad de bytes que fueros recibidos
+        // --------------------------------------------------
+
+        int len = uart_read_bytes(
+            PORT_MAESTRO,
+            rx_buffer, //dónde se van a guardar los bytes recibidos
+            sizeof(rx_buffer), //leemos como máximo 256 bytes
+            pdMS_TO_TICKS(500) //esperamos 500ms por dato
+        );
+
+
+        // --------------------------------------------------
+        // Verificar si recibimos datos
+        // --------------------------------------------------
+
+        if (len > 0)
+        {
+            modbus_frame_t frame; //creamos una variable para guardar cuántos datos fueron recibidos y cuántos bytes
+
+            // Limitar tamaño por seguridad
+            if (len > MODBUS_FRAME_SIZE)
+            {
+                len = MODBUS_FRAME_SIZE;
+            }
+
+
+            // --------------------------------------------------
+            // Copiar los datos recibidos a la estructura
+            // --------------------------------------------------
+
+            memcpy(
+                frame.data, //destino
+                rx_buffer, //origen
+                len //cantidad
+            );
+
+            frame.length = len; //guardamos la cantidad de bytes
+
+
+            // --------------------------------------------------
+            // Enviar la trama a la cola 
+            // --------------------------------------------------
+
+            if (xQueueSend(
+                    modbus_queue,
+                    &frame, //toma el contenido de frame y lo mete en la cola
+                    pdMS_TO_TICKS(100)
+                ) == pdTRUE)
+
+            //todo lo que esta en frame se pasa a la cola
+            {
+                ESP_LOGI(
+                    TAG,
+                    "Trama recibida y enviada a la cola"
+                );
+
+
+                // --------------------------------------------------
+                // Avisar mediante el semáforo que llegó una respuesta
+                // --------------------------------------------------
+
+                xSemaphoreGive(response_semaphore);
+            }
+            //en caso de que la cola este llena
+            else
+            {
+                ESP_LOGW(
+                    TAG,
+                    "No se pudo enviar la trama a la cola"
+                );
+            }
+        }
+    }
+}
+
+
+// ======================================================
+// FC03 - READ HOLDING REGISTERS
+// ======================================================
+
+void modbus_read_holding_registers(
+    uint8_t slave_id,
+    uint16_t start_address,
+    uint16_t quantity
+)
 
 
 
