@@ -1,0 +1,2 @@
+# Tick de 1 ms: necesario para medir el silencio T3.5 (~4 ms) con precision
+CONFIG_FREERTOS_HZ=1000

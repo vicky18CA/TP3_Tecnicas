@@ -1,3 +1,5 @@
+# Proyecto ESP-IDF: modbus_esclavo
 cmake_minimum_required(VERSION 3.16)
+
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
-project(TP3_Tecnicas)
+project(modbus_esclavo)
