@@ -25,6 +25,8 @@
 #include "driver/uart.h"
 #include "esp_log.h"
 #include "esp_err.h"
+#include "esp_system.h"
+#include "esp_chip_info.h"
 
 #define TAG "MODBUS_MASTER"
 
@@ -229,7 +231,6 @@ void uart_rx_task(void *pvParameters)
 static esp_err_t modbus_transaccion(const uint8_t *req, int req_len, modbus_frame_t *resp)
 {
     // Limpiar restos de respuestas anteriores (tardías, ruido, etc.)
-    uart_flush_input(PORT_MAESTRO);
     xQueueReset(modbus_queue);
     xSemaphoreTake(response_semaphore, 0);
 
@@ -451,6 +452,29 @@ static void leer_y_mostrar(uint8_t slave_id, uint16_t start, uint16_t qty)
     }
 }
 
+// Escribe Estado (FC06) y lo relee (FC03) para confirmar que el esclavo lo aplicó
+static void comandar_led(uint8_t slave_id, uint16_t estado)
+{
+    // 1) El eco del FC06 ya valida que el esclavo recibió y aceptó el valor
+    if (!mb_check("FC06", slave_id, modbus_write_single_register(slave_id, REG_ESTADO, estado)))
+        return;
+
+    vTaskDelay(pdMS_TO_TICKS(100));
+
+    // 2) Releer el registro para verificar que quedó guardado
+    uint16_t leido = 0xFFFF;
+    if (!mb_check("FC03 (verificacion)", slave_id,
+                  modbus_read_holding_registers(slave_id, REG_ESTADO, 1, &leido)))
+        return;
+
+    if (leido == estado)
+        ESP_LOGI(TAG, "OK: esclavo %d confirmo Estado (40004) = %u -> LED %s",
+                 slave_id, leido, leido ? "ON" : "OFF");
+    else
+        ESP_LOGE(TAG, "FALLO: esclavo %d tiene Estado = %u, se esperaba %u",
+                 slave_id, leido, estado);
+}
+
 // ======================================================
 // TAREA DEL MAESTRO MODBUS
 // ======================================================
@@ -474,10 +498,13 @@ void modbus_master_task(void *pvParameters)
         leer_y_mostrar(SLAVE_ID1, REG_ADC1, 7);     // releer para verificar
     vTaskDelay(pdMS_TO_TICKS(100));
 
-    // ---------------- Ciclo normal ----------------
-    uint32_t ciclo = 0;
-    uint16_t estado = 0;
+    ESP_LOGI(TAG, "=== Prueba 4: activar parpadeo del LED en esclavos 1 y 2 ===");
+    comandar_led(SLAVE_ID1, 1);
+    vTaskDelay(pdMS_TO_TICKS(100));
+    comandar_led(SLAVE_ID2, 1);
+    vTaskDelay(pdMS_TO_TICKS(100));
 
+    // ---------------- Ciclo normal ----------------
     while (1)
     {
         // Prueba 5: consultar alternativamente a los esclavos
@@ -488,16 +515,6 @@ void modbus_master_task(void *pvParameters)
         ESP_LOGI(TAG, "--- Consultando esclavo 2 ---");
         leer_y_mostrar(SLAVE_ID2, REG_ADC1, 4);
         vTaskDelay(pdMS_TO_TICKS(100));
-
-        // Prueba 4: cada 5 ciclos alternar el LED de ambos esclavos (FC06)
-        if (++ciclo % 5 == 0)
-        {
-            estado = !estado;
-            ESP_LOGI(TAG, "=== FC06: Estado (40004) = %u en esclavos 1 y 2 ===", estado);
-            mb_check("FC06", SLAVE_ID1, modbus_write_single_register(SLAVE_ID1, REG_ESTADO, estado));
-            vTaskDelay(pdMS_TO_TICKS(100));
-            mb_check("FC06", SLAVE_ID2, modbus_write_single_register(SLAVE_ID2, REG_ESTADO, estado));
-        }
 
         // Ante cualquier error el programa sigue funcionando normalmente
         vTaskDelay(pdMS_TO_TICKS(1000));
@@ -510,9 +527,16 @@ void modbus_master_task(void *pvParameters)
 
 void app_main(void)
 {
-    ESP_LOGI(TAG, "================================");
-    ESP_LOGI(TAG, "Iniciando Maestro Modbus RTU");
-    ESP_LOGI(TAG, "UART: 9600 8E1 | Esclavos: ID %d e ID %d", SLAVE_ID1, SLAVE_ID2);
+    esp_chip_info_t chip;
+    esp_chip_info(&chip);
+
+    ESP_LOGI(TAG, "==================================================");
+    ESP_LOGI(TAG, " FIRMWARE GRABADO Y EJECUTANDOSE CORRECTAMENTE");
+    ESP_LOGI(TAG, " Compilado : %s %s", __DATE__, __TIME__);
+    ESP_LOGI(TAG, " ESP-IDF   : %s", esp_get_idf_version());
+    ESP_LOGI(TAG, " Chip      : ESP32, %d nucleo(s), rev %d", chip.cores, chip.revision);
+    ESP_LOGI(TAG, " Maestro   : UART 9600 8E1 | Esclavos: ID %d e ID %d", SLAVE_ID1, SLAVE_ID2);
+    ESP_LOGI(TAG, "==================================================");
 
     rs485_init();
 

@@ -26,6 +26,8 @@
 #include "esp_adc/adc_oneshot.h"
 #include "esp_log.h"
 #include "esp_err.h"
+#include "esp_system.h"
+#include "esp_chip_info.h"
 
 #define TAG "MODBUS_SLAVE"
 
@@ -48,6 +50,7 @@
 // Silencio que marca el fin de trama: T3.5 = 3.5 * 11 bits / 9600 = 4.01 ms
 // Con tick de 10 ms (CONFIG_FREERTOS_HZ=100) se redondea a 1 tick (10 ms): sigue funcionando.
 #define T35_MS              5
+#define LED_BLINK_MS   500      // medio período del parpadeo (500 ms ON / 500 ms OFF)
 
 // Periféricos
 #define LED_GPIO            GPIO_NUM_2
@@ -397,17 +400,40 @@ void adquisicion_task(void *pvParameters)
 void aplicacion_task(void *pvParameters)
 {
     gpio_reset_pin(LED_GPIO);
-    gpio_set_direction(LED_GPIO, GPIO_MODE_OUTPUT);
+    gpio_set_direction(LED_GPIO, GPIO_MODE_INPUT_OUTPUT);
     gpio_set_level(LED_GPIO, 0);
+
+    // Parpadeo de arranque: confirmación visual de que el firmware corre
+    for (int i = 0; i < 3; i++)
+    {
+        gpio_set_level(LED_GPIO, 1); vTaskDelay(pdMS_TO_TICKS(150));
+        gpio_set_level(LED_GPIO, 0); vTaskDelay(pdMS_TO_TICKS(150));
+    }
+    ESP_LOGI(TAG, "LED (GPIO%d) inicializado y probado", LED_GPIO);
+
+    bool led = false;
 
     while (1)
     {
-        // Duerme hasta que el Maestro escribe el registro Estado
-        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-
+        // Estado = 1: despertar cada LED_BLINK_MS para alternar el LED.
+        // Estado = 0: dormir hasta que el Maestro escriba el registro.
         uint16_t estado = reg_get(REG_ESTADO);
-        gpio_set_level(LED_GPIO, estado ? 1 : 0);
-        ESP_LOGI(TAG, "Estado (40004) = %u -> LED %s", estado, estado ? "ON" : "OFF");
+        TickType_t espera = estado ? pdMS_TO_TICKS(LED_BLINK_MS) : portMAX_DELAY;
+
+        if (ulTaskNotifyTake(pdTRUE, espera) > 0)
+        {
+            // El Maestro escribió Estado: arrancar o detener el parpadeo
+            estado = reg_get(REG_ESTADO);
+            led = (estado != 0);
+            gpio_set_level(LED_GPIO, led);
+            ESP_LOGI(TAG, "Estado (40004) = %u -> parpadeo %s", estado, estado ? "ACTIVO" : "DETENIDO");
+        }
+        else
+        {
+            // Timeout con Estado = 1: alternar el LED
+            led = !led;
+            gpio_set_level(LED_GPIO, led);
+        }
     }
 }
 
@@ -417,7 +443,16 @@ void aplicacion_task(void *pvParameters)
 
 void app_main(void)
 {
-    ESP_LOGI(TAG, "Iniciando Esclavo Modbus RTU | Direccion: %d | UART: 9600 8E1", SLAVE_ADDR);
+    esp_chip_info_t chip;
+    esp_chip_info(&chip);
+
+    ESP_LOGI(TAG, "==================================================");
+    ESP_LOGI(TAG, " FIRMWARE GRABADO Y EJECUTANDOSE CORRECTAMENTE");
+    ESP_LOGI(TAG, " Compilado : %s %s", __DATE__, __TIME__);
+    ESP_LOGI(TAG, " ESP-IDF   : %s", esp_get_idf_version());
+    ESP_LOGI(TAG, " Chip      : ESP32, %d nucleo(s), rev %d", chip.cores, chip.revision);
+    ESP_LOGI(TAG, " Esclavo   : direccion %d | UART 9600 8E1", SLAVE_ADDR);
+    ESP_LOGI(TAG, "==================================================");
 
     registros_mutex = xSemaphoreCreateMutex();
     if (registros_mutex == NULL)
