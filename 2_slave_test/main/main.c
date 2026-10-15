@@ -9,8 +9,11 @@
  *
  * Tareas FreeRTOS:
  *   modbus_slave_task : recibe tramas, valida CRC/dirección y responde
- *   adquisicion_task  : ADC1, ADC2 y contador -> mapa de registros
+ *   adquisicion_task  : ADC1 (potenciómetro), ADC2 y contador -> mapa de registros
  *   aplicacion_task   : registro Estado (40004) -> LED
+ *
+ * POTENCIÓMETRO: extremos a 3.3 V y GND, cursor (pin central) a GPIO34.
+ * Su valor (0-4095) queda en el registro 40001 (ADC1).
  *
  * IMPORTANTE: cambiar SLAVE_ADDR (1 o 2) antes de flashear cada esclavo.
  * ====================================================================== */
@@ -50,12 +53,14 @@
 // Silencio que marca el fin de trama: T3.5 = 3.5 * 11 bits / 9600 = 4.01 ms
 // Con tick de 10 ms (CONFIG_FREERTOS_HZ=100) se redondea a 1 tick (10 ms): sigue funcionando.
 #define T35_MS              5
-#define LED_BLINK_MS   500      // medio período del parpadeo (500 ms ON / 500 ms OFF)
 
 // Periféricos
 #define LED_GPIO            GPIO_NUM_2
-#define ADC1_CANAL          ADC_CHANNEL_6   // GPIO34
-#define ADC2_CANAL          ADC_CHANNEL_7   // GPIO35
+#define ADC1_CANAL          ADC_CHANNEL_6   // GPIO34  <- POTENCIÓMETRO (registro 40001)
+#define ADC2_CANAL          ADC_CHANNEL_7   // GPIO35  (registro 40002)
+
+// Promedio de muestras para estabilizar la lectura del potenciómetro
+#define ADC_MUESTRAS        16
 
 // Códigos de función
 #define FC_READ_HOLDING_REGISTERS    0x03
@@ -71,7 +76,7 @@
 // MAPA DE REGISTROS (dirección PDU base 0: 40001 -> 0)
 // ======================================================
 
-#define REG_ADC1        0   // 40001 Valor analógico 1
+#define REG_ADC1        0   // 40001 Valor analógico 1 (potenciómetro en GPIO34)
 #define REG_ADC2        1   // 40002 Valor analógico 2
 #define REG_CONTADOR    2   // 40003 Contador (+1 por segundo)
 #define REG_ESTADO      3   // 40004 Estado: 0 = OFF, 1 = ON (controla el LED)
@@ -253,7 +258,8 @@ static int procesar_trama(const uint8_t *rx, int len, uint8_t *tx)
             { n = armar_excepcion(fc, EX_ILLEGAL_VALUE, tx); break; }
 
             reg_set(reg, valor);
-            if (reg == REG_ESTADO) xTaskNotifyGive(aplicacion_handle);
+
+            if (reg == REG_ESTADO || reg == REG_TIEMPO) xTaskNotifyGive(aplicacion_handle);
 
             memcpy(tx, rx, 6);
             n = agregar_crc(tx, 6);
@@ -362,6 +368,24 @@ void modbus_slave_task(void *pvParameters)
 // TAREA DE ADQUISICIÓN: ADC -> mapa de registros
 // ======================================================
 
+// Promedia varias lecturas de un canal para filtrar el ruido del ADC
+static uint16_t adc_leer_promedio(adc_oneshot_unit_handle_t adc, adc_channel_t canal)
+{
+    uint32_t suma = 0;
+    int validas = 0;
+
+    for (int i = 0; i < ADC_MUESTRAS; i++)
+    {
+        int v = 0;
+        if (adc_oneshot_read(adc, canal, &v) == ESP_OK)
+        {
+            suma += (uint32_t)v;
+            validas++;
+        }
+    }
+    return (validas > 0) ? (uint16_t)(suma / validas) : 0;
+}
+
 void adquisicion_task(void *pvParameters)
 {
     adc_oneshot_unit_handle_t adc;
@@ -379,12 +403,12 @@ void adquisicion_task(void *pvParameters)
 
     while (1)
     {
-        int v1 = 0, v2 = 0;
-        adc_oneshot_read(adc, ADC1_CANAL, &v1);
-        adc_oneshot_read(adc, ADC2_CANAL, &v2);
+        // ADC1 = potenciómetro (GPIO34) -> registro 40001
+        uint16_t v1 = adc_leer_promedio(adc, ADC1_CANAL);
+        uint16_t v2 = adc_leer_promedio(adc, ADC2_CANAL);
 
-        reg_set(REG_ADC1, (uint16_t)v1);
-        reg_set(REG_ADC2, (uint16_t)v2);
+        reg_set(REG_ADC1, v1);
+        reg_set(REG_ADC2, v2);
 
         if (++ciclos % 5 == 0)              // 5 ciclos x 200 ms = 1 s
             reg_set(REG_CONTADOR, reg_get(REG_CONTADOR) + 1);
@@ -403,34 +427,28 @@ void aplicacion_task(void *pvParameters)
     gpio_set_direction(LED_GPIO, GPIO_MODE_INPUT_OUTPUT);
     gpio_set_level(LED_GPIO, 0);
 
-    // Parpadeo de arranque: confirmación visual de que el firmware corre
-    for (int i = 0; i < 3; i++)
-    {
-        gpio_set_level(LED_GPIO, 1); vTaskDelay(pdMS_TO_TICKS(150));
-        gpio_set_level(LED_GPIO, 0); vTaskDelay(pdMS_TO_TICKS(150));
-    }
-    ESP_LOGI(TAG, "LED (GPIO%d) inicializado y probado", LED_GPIO);
-
     bool led = false;
 
     while (1)
     {
-        // Estado = 1: despertar cada LED_BLINK_MS para alternar el LED.
-        // Estado = 0: dormir hasta que el Maestro escriba el registro.
-        uint16_t estado = reg_get(REG_ESTADO);
-        TickType_t espera = estado ? pdMS_TO_TICKS(LED_BLINK_MS) : portMAX_DELAY;
+        uint16_t estado = reg_get(REG_ESTADO);      // 40004: 0 = apagado, 1 = parpadeando
+        uint16_t periodo_ms = reg_get(REG_TIEMPO);  // 40006: período en ms
+
+        // Valor por defecto o seguridad mínima para que no sature la CPU
+        if (periodo_ms < 50) periodo_ms = 500;
+
+        TickType_t espera = (estado != 0) ? pdMS_TO_TICKS(periodo_ms) : portMAX_DELAY;
 
         if (ulTaskNotifyTake(pdTRUE, espera) > 0)
         {
-            // El Maestro escribió Estado: arrancar o detener el parpadeo
+            // El Maestro escribió un registro (se actualizó Estado, Tiempo o Modo)
             estado = reg_get(REG_ESTADO);
             led = (estado != 0);
             gpio_set_level(LED_GPIO, led);
-            ESP_LOGI(TAG, "Estado (40004) = %u -> parpadeo %s", estado, estado ? "ACTIVO" : "DETENIDO");
         }
         else
         {
-            // Timeout con Estado = 1: alternar el LED
+            // Timeout: alternar el LED con el período configurado
             led = !led;
             gpio_set_level(LED_GPIO, led);
         }
@@ -448,10 +466,11 @@ void app_main(void)
 
     ESP_LOGI(TAG, "==================================================");
     ESP_LOGI(TAG, " FIRMWARE GRABADO Y EJECUTANDOSE CORRECTAMENTE");
-    ESP_LOGI(TAG, " Compilado : %s %s", __DATE__, __TIME__);
+    //ESP_LOGI(TAG, " Compilado : %s %s", _DATE, __TIME_);
     ESP_LOGI(TAG, " ESP-IDF   : %s", esp_get_idf_version());
     ESP_LOGI(TAG, " Chip      : ESP32, %d nucleo(s), rev %d", chip.cores, chip.revision);
     ESP_LOGI(TAG, " Esclavo   : direccion %d | UART 9600 8E1", SLAVE_ADDR);
+    ESP_LOGI(TAG, " Potenciometro: GPIO34 (ADC1_CH6) -> registro 40001");
     ESP_LOGI(TAG, "==================================================");
 
     registros_mutex = xSemaphoreCreateMutex();

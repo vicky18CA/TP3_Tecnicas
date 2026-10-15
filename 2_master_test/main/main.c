@@ -10,8 +10,13 @@
  * Tareas FreeRTOS:
  *   uart_rx_task        : recibe tramas completas (fin = silencio T3.5)
  *                         y las manda a la cola + semáforo
- *   modbus_master_task  : genera solicitudes, espera respuestas,
- *                         valida y detecta errores / timeout
+ *   modbus_master_task  : ciclo automático opcional (consulta a los
+ *                         esclavos 1 y 2), se activa/desactiva desde el menú
+ *   consola_menu_task   : MENÚ por consola. Es la interfaz principal:
+ *                         el usuario elige qué ver y qué comandar.
+ *
+ * Por defecto NO se imprime nada solo: ni tramas, ni ciclo automático.
+ * Todo se activa a pedido desde el menú.
  * ====================================================================== */
 
 #include <stdio.h>
@@ -69,14 +74,25 @@
 #define REG_MODO        6
 #define REG_ERRORES     7
 
+// ADC del esclavo: 12 bits, atenuación 12 dB (~0 a 3.3 V)
+#define ADC_MAX_RAW         4095
+#define ADC_VREF_MV         3300
+
 // Código propio para "el esclavo respondió con una excepción Modbus"
 #define MB_ERR_EXCEPCION    ESP_ERR_INVALID_STATE
+
+// ======================================================
+// OPCIONES ACTIVABLES DESDE EL MENÚ
+// ======================================================
+
+static volatile bool mostrar_tramas = false;  // [T] ver TX/RX en hexadecimal
+static volatile bool ciclo_auto     = false;  // [C] consulta automática de esclavos 1 y 2
 
 // ======================================================
 // ESTRUCTURAS Y OBJETOS DE SINCRONIZACIÓN
 // ======================================================
 
-// Trama recibida (uart_rx_task -> modbus_master_task)
+// Trama recibida (uart_rx_task -> modbus_master_task / consola)
 typedef struct
 {
     uint8_t  data[MODBUS_FRAME_SIZE];
@@ -85,6 +101,7 @@ typedef struct
 
 static QueueHandle_t     modbus_queue;        // cola de tramas recibidas
 static SemaphoreHandle_t response_semaphore;  // avisa que llegó una respuesta
+static SemaphoreHandle_t bus_mutex;           // una sola transacción a la vez en el bus
 
 // ======================================================
 // CRC-16 MODBUS (poly 0xA001, init 0xFFFF)
@@ -94,7 +111,6 @@ static SemaphoreHandle_t response_semaphore;  // avisa que llegó una respuesta
 // Quien recibe una trama recalcula el CRC sobre todo menos
 // los 2 últimos bytes y lo compara con el recibido (o, lo que
 // es equivalente, el CRC de la trama completa da 0).
-// Cada trama (pedido y respuesta) lleva su propio CRC.
 // ======================================================
 
 uint16_t modbus_crc16(const uint8_t *data, uint16_t length)
@@ -176,8 +192,7 @@ void rs485_send(const uint8_t *data, size_t length)
 //
 // Una trama Modbus RTU termina cuando el bus queda en silencio
 // por lo menos T3.5. Por eso se lee el primer byte bloqueando
-// y después se sigue leyendo con timeout de T3.5: apenas hay
-// silencio, la trama está completa y se entrega enseguida.
+// y después se sigue leyendo con timeout de T3.5.
 // ======================================================
 
 void uart_rx_task(void *pvParameters)
@@ -226,30 +241,52 @@ void uart_rx_task(void *pvParameters)
 
 // ======================================================
 // TRANSACCIÓN: envía un pedido y espera la respuesta
+//
+// Se protege con un mutex porque hay DOS tareas que usan el bus
+// (modbus_master_task y consola_menu_task).
+// Las tramas TX/RX solo se imprimen si el usuario activó [T].
 // ======================================================
 
-static esp_err_t modbus_transaccion(const uint8_t *req, int req_len, modbus_frame_t *resp)
+// Imprime una trama en hexadecimal en una sola línea (solo con [T] activo)
+static void imprimir_trama(const char *etiqueta, const uint8_t *buf, int len)
+{
+    printf("   %s (%d bytes):", etiqueta, len);
+    for (int i = 0; i < len; i++)
+        printf(" %02X", buf[i]);
+    printf("\n");
+}
+
+static esp_err_t modbus_transaccion_locked(const uint8_t *req, int req_len, modbus_frame_t *resp)
 {
     // Limpiar restos de respuestas anteriores (tardías, ruido, etc.)
     xQueueReset(modbus_queue);
     xSemaphoreTake(response_semaphore, 0);
 
-    ESP_LOGI(TAG, "TX (%d bytes):", req_len);
-    ESP_LOG_BUFFER_HEX(TAG, req, req_len);
+    if (mostrar_tramas) imprimir_trama("TX", req, req_len);
 
     rs485_send(req, req_len);
 
     // Esperar a que uart_rx_task avise que llegó una trama
     if (xSemaphoreTake(response_semaphore, pdMS_TO_TICKS(RESPUESTA_TIMEOUT_MS)) != pdTRUE)
+    {
+        if (mostrar_tramas) printf("   RX: (sin respuesta, timeout)\n");
         return ESP_ERR_TIMEOUT;
+    }
 
     if (xQueueReceive(modbus_queue, resp, 0) != pdTRUE)
         return ESP_FAIL;
 
-    ESP_LOGI(TAG, "RX (%d bytes):", resp->length);
-    ESP_LOG_BUFFER_HEX(TAG, resp->data, resp->length);
+    if (mostrar_tramas) imprimir_trama("RX", resp->data, resp->length);
 
     return ESP_OK;
+}
+
+static esp_err_t modbus_transaccion(const uint8_t *req, int req_len, modbus_frame_t *resp)
+{
+    xSemaphoreTake(bus_mutex, portMAX_DELAY);
+    esp_err_t e = modbus_transaccion_locked(req, req_len, resp);
+    xSemaphoreGive(bus_mutex);
+    return e;
 }
 
 // ======================================================
@@ -439,7 +476,18 @@ static bool mb_check(const char *operacion, uint8_t slave_id, esp_err_t e)
     return false;
 }
 
-// Lee 'qty' registros desde 'start' y los muestra por la UART
+// Muestra el valor del potenciómetro (ADC1) en crudo, voltios y porcentaje
+static void mostrar_adc1(uint8_t slave_id, uint16_t raw)
+{
+    uint32_t mv  = ((uint32_t)raw * ADC_VREF_MV) / ADC_MAX_RAW;
+    uint32_t pct = ((uint32_t)raw * 100) / ADC_MAX_RAW;
+
+    printf(">> Esclavo %d - POTENCIOMETRO (ADC1, 40001): raw = %u | %u.%03u V | %u %%\n",
+           slave_id, raw, (unsigned)(mv / 1000), (unsigned)(mv % 1000), (unsigned)pct);
+}
+
+// Lee 'qty' registros desde 'start' y los muestra por la UART.
+// Si entre ellos está el ADC1 (40001), además lo muestra en V y %.
 static void leer_y_mostrar(uint8_t slave_id, uint16_t start, uint16_t qty)
 {
     uint16_t regs[16];
@@ -448,8 +496,32 @@ static void leer_y_mostrar(uint8_t slave_id, uint16_t start, uint16_t qty)
     if (mb_check("FC03", slave_id, modbus_read_holding_registers(slave_id, start, qty, regs)))
     {
         for (int i = 0; i < qty; i++)
-            ESP_LOGI(TAG, "Esclavo %d - %d = %u", slave_id, 40001 + start + i, regs[i]);
+        {
+            uint16_t dir = 40001 + start + i;
+            
+            // Si es el Esclavo 2 y el registro es 40002 (REG_BOTON), aclaramos el estado lógico:
+            if (slave_id == SLAVE_ID2 && dir == 40002)
+            {
+                printf(">> Esclavo %d - %d (PULSADOR) = %u -> %s\n", 
+                       slave_id, dir, regs[i], regs[i] ? "PRESIONADO" : "SUELTO");
+            }
+            else
+            {
+                printf(">> Esclavo %d - %d = %u\n", slave_id, dir, regs[i]);
+            }
+        }
+
+        if (start == REG_ADC1) // regs[0] es el potenciómetro
+            mostrar_adc1(slave_id, regs[0]);
     }
+}
+
+// Lee SOLO el registro del potenciómetro (ADC1, 40001) de un esclavo
+static void leer_potenciometro(uint8_t slave_id)
+{
+    uint16_t raw = 0;
+    if (mb_check("FC03 (ADC1)", slave_id, modbus_read_holding_registers(slave_id, REG_ADC1, 1, &raw)))
+        mostrar_adc1(slave_id, raw);
 }
 
 // Escribe Estado (FC06) y lo relee (FC03) para confirmar que el esclavo lo aplicó
@@ -468,56 +540,242 @@ static void comandar_led(uint8_t slave_id, uint16_t estado)
         return;
 
     if (leido == estado)
-        ESP_LOGI(TAG, "OK: esclavo %d confirmo Estado (40004) = %u -> LED %s",
-                 slave_id, leido, leido ? "ON" : "OFF");
+        printf(">> OK: esclavo %d confirmo Estado (40004) = %u -> LED %s\n",
+               slave_id, leido, leido ? "ON (parpadeando)" : "OFF");
     else
-        ESP_LOGE(TAG, "FALLO: esclavo %d tiene Estado = %u, se esperaba %u",
-                 slave_id, leido, estado);
+        printf(">> FALLO: esclavo %d tiene Estado = %u, se esperaba %u\n",
+               slave_id, leido, estado);
 }
 
-// ======================================================
-// TAREA DEL MAESTRO MODBUS
-// ======================================================
-
-void modbus_master_task(void *pvParameters)
+// Cambia el período de parpadeo con FC16 (Setpoint, Tiempo, Modo)
+static void cambiar_parpadeo(uint8_t slave_id, uint16_t periodo_ms)
 {
-    vTaskDelay(pdMS_TO_TICKS(1000));        // dar tiempo a que arranquen los esclavos
+    const uint16_t params[3] = { 100, periodo_ms, 1 };   // Setpoint, Tiempo (ms), Modo
 
-    // ---------------- Pruebas iniciales (una sola vez) ----------------
-    ESP_LOGI(TAG, "=== Prueba 1: leer UN registro (40001) del esclavo 1 ===");
+    if (mb_check("FC16", slave_id,
+                 modbus_write_multiple_registers(slave_id, REG_SETPOINT, 3, params)))
+    {
+        printf(">> OK: esclavo %d - periodo de parpadeo = %u ms\n", slave_id, periodo_ms);
+    }
+}
+
+// Pruebas obligatorias 1 a 5 del TP, ejecutadas a pedido con [R]
+static void ejecutar_pruebas(void)
+{
+    printf("\n=== Prueba 1: leer UN registro (40001) del esclavo 1 ===\n");
     leer_y_mostrar(SLAVE_ID1, REG_ADC1, 1);
     vTaskDelay(pdMS_TO_TICKS(100));
 
-    ESP_LOGI(TAG, "=== Prueba 2: leer VARIOS registros (40001-40004) del esclavo 1 ===");
+    printf("\n=== Prueba 2: leer VARIOS registros (40001-40004) del esclavo 1 ===\n");
     leer_y_mostrar(SLAVE_ID1, REG_ADC1, 4);
     vTaskDelay(pdMS_TO_TICKS(100));
 
-    ESP_LOGI(TAG, "=== Prueba 3: FC16, escribir 40005-40007 (Setpoint, Tiempo, Modo) ===");
-    const uint16_t valores[3] = { 100, 60, 2 };
+    printf("\n=== Prueba 3: FC16, escribir 40005-40007 (Setpoint, Tiempo, Modo) ===\n");
+    const uint16_t valores[3] = { 100, 500, 1 };
     if (mb_check("FC16", SLAVE_ID1, modbus_write_multiple_registers(SLAVE_ID1, REG_SETPOINT, 3, valores)))
         leer_y_mostrar(SLAVE_ID1, REG_ADC1, 7);     // releer para verificar
     vTaskDelay(pdMS_TO_TICKS(100));
 
-    ESP_LOGI(TAG, "=== Prueba 4: activar parpadeo del LED en esclavos 1 y 2 ===");
+    printf("\n=== Prueba 4: activar parpadeo del LED en esclavos 1 y 2 ===\n");
     comandar_led(SLAVE_ID1, 1);
     vTaskDelay(pdMS_TO_TICKS(100));
     comandar_led(SLAVE_ID2, 1);
     vTaskDelay(pdMS_TO_TICKS(100));
 
-    // ---------------- Ciclo normal ----------------
+    printf("\n=== Prueba 5: consultar alternativamente esclavo 1 y esclavo 2 ===\n");
+    leer_y_mostrar(SLAVE_ID1, REG_ADC1, 4);
+    vTaskDelay(pdMS_TO_TICKS(100));
+    leer_y_mostrar(SLAVE_ID2, REG_ADC1, 4);
+}
+
+// ======================================================
+// TAREA DEL MAESTRO MODBUS (ciclo automático opcional)
+//
+// Solo consulta a los esclavos cuando el usuario activó [C].
+// Ante cualquier error el programa sigue funcionando normalmente.
+// ======================================================
+
+void modbus_master_task(void *pvParameters)
+{
     while (1)
     {
-        // Prueba 5: consultar alternativamente a los esclavos
-        ESP_LOGI(TAG, "--- Consultando esclavo 1 ---");
+        if (!ciclo_auto)
+        {
+            vTaskDelay(pdMS_TO_TICKS(200));     // inactivo: espera sin tocar el bus
+            continue;
+        }
+
+        printf("\n--- [Ciclo] Consultando esclavo 1 ---\n");
         leer_y_mostrar(SLAVE_ID1, REG_ADC1, 4);
         vTaskDelay(pdMS_TO_TICKS(100));
 
-        ESP_LOGI(TAG, "--- Consultando esclavo 2 ---");
-        leer_y_mostrar(SLAVE_ID2, REG_ADC1, 4);
-        vTaskDelay(pdMS_TO_TICKS(100));
+        if (!ciclo_auto) continue;              // por si lo apagaron mientras tanto
 
-        // Ante cualquier error el programa sigue funcionando normalmente
+        printf("--- [Ciclo] Consultando esclavo 2 ---\n");
+        leer_y_mostrar(SLAVE_ID2, REG_ADC1, 4);
+
         vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
+
+// ======================================================
+// MENÚ DE CONSOLA
+// ======================================================
+
+static void mostrar_menu(void)
+{
+    printf("\n======================================================\n");
+    printf("              MENU DE CONTROL MODBUS RTU              \n");
+    printf("======================================================\n");
+    printf(" LED / ESCRITURA\n");
+    printf("   [1] LED Esclavo 1 -> ON  (FC06)\n");
+    printf("   [0] LED Esclavo 1 -> OFF (FC06)\n");
+    printf("   [3] LED Esclavo 2 -> ON  (FC06)\n");
+    printf("   [4] LED Esclavo 2 -> OFF (FC06)\n");
+    printf("   [+] Parpadeo rapido  200 ms, Esclavo 1 (FC16)\n");
+    printf("   [-] Parpadeo lento  1000 ms, Esclavo 1 (FC16)\n");
+    printf("   [*] Parpadeo rapido 200 ms,  Esclavo 2 (FC16)\n");
+    printf("   [/] Parpadeo lento 1000 ms,  Esclavo 2 (FC16)\n");
+    printf(" LECTURA\n");
+    printf("   [P] Potenciometro (ADC1) - Esclavo 1\n");
+    printf("   [Q] Potenciometro (ADC1) -Esclavo 2\n");
+    printf("   [L] Todos los registros - Esclavo 1 (40001-40007)\n");
+    printf("   [2] Registros 40001-40004 - Esclavo 2\n");
+    printf(" OPCIONES\n");
+    printf("   [T] Ver tramas TX/RX en hex ........ %s\n", mostrar_tramas ? "ACTIVADO" : "desactivado");
+    printf("   [C] Ciclo automatico esclavos 1 y 2  %s\n", ciclo_auto ? "ACTIVADO" : "desactivado");
+    printf("   [K] Enviar trama con CRC corrupto (Prueba Timeout - Esclavo 1)\n");
+    printf("   [O] Enviar trama con CRC corrupto (Prueba Timeout - Esclavo 2)\n");
+    printf("   [R] Ejecutar pruebas obligatorias 1 a 5\n");
+    printf("   [M] Mostrar este menu\n");
+    printf("======================================================\n");
+    printf("Elegi una opcion: ");
+    fflush(stdout);
+}
+
+void consola_menu_task(void *pvParameters)
+{
+    // Espera inicial para que arranquen las tareas y se estabilice el bus
+    vTaskDelay(pdMS_TO_TICKS(1500));
+
+    mostrar_menu();
+
+    while (1)
+    {
+        int c = fgetc(stdin);
+
+        // Si no hay datos en el buffer de entrada, esperamos un momento
+        if (c == EOF)
+        {
+            vTaskDelay(pdMS_TO_TICKS(50));
+            continue;
+        }
+
+        // Se ignoran Enter / espacios: el menú se vuelve a mostrar solo
+        // después de cada comando
+        if (c == '\n' || c == '\r' || c == ' ') continue;
+
+        printf("%c\n", c);                      // eco de la opción elegida
+
+        switch (c)
+        {
+            case '1': comandar_led(SLAVE_ID1, 1); break;
+            case '0': comandar_led(SLAVE_ID1, 0); break;
+            case '3': comandar_led(SLAVE_ID2, 1); break;
+            case '4': comandar_led(SLAVE_ID2, 0); break;
+
+            case '+': cambiar_parpadeo(SLAVE_ID1, 200);  break;
+            case '-': cambiar_parpadeo(SLAVE_ID1, 1000); break;
+            case '*': cambiar_parpadeo(SLAVE_ID2, 200);  break;
+            case '/': cambiar_parpadeo(SLAVE_ID2, 1000); break;
+            case 'p':
+            case 'P': leer_potenciometro(SLAVE_ID1); break;
+
+            case 'q':
+            case 'Q': leer_potenciometro(SLAVE_ID2); break;
+
+            case 'l':
+            case 'L': leer_y_mostrar(SLAVE_ID1, REG_ADC1, 7); break;
+
+            case '2': leer_y_mostrar(SLAVE_ID2, REG_ADC1, 4); break;
+
+            case 't':
+            case 'T':
+                mostrar_tramas = !mostrar_tramas;
+                printf(">> Tramas TX/RX: %s\n", mostrar_tramas ? "ACTIVADAS" : "desactivadas");
+                break;
+
+            case 'c':
+            case 'C':
+                ciclo_auto = !ciclo_auto;
+                printf(">> Ciclo automatico: %s\n", ciclo_auto ? "ACTIVADO" : "desactivado");
+                break;
+
+            case 'r':
+            case 'R': ejecutar_pruebas(); break;
+
+            case 'k':
+            case 'K':
+            {
+                printf("\n>> [TEST] Enviando lectura con CRC corrupto al Esclavo 1...\n");
+                
+                // Trama FC03 para leer 1 registro (REG_ADC1) con CRC alterado a 0x0000
+                uint8_t req_corrupto[8] = {
+                    SLAVE_ID1,                    // ID esclavo (1)
+                    FC_READ_HOLDING_REGISTERS,    // Función 0x03
+                    0x00, 0x00,                   // Registro inicial 0
+                    0x00, 0x01,                   // Cantidad 1
+                    0x00, 0x00                    // CRC erróneo forzado
+                };
+                
+                modbus_frame_t resp;
+                
+                // modbus_transaccion envía por RS-485 y espera hasta RESPUESTA_TIMEOUT_MS (500 ms)
+                esp_err_t err = modbus_transaccion(req_corrupto, sizeof(req_corrupto), &resp);
+                
+                // mb_check evalúa el error e imprime el mensaje correspondiente
+                if (!mb_check("Lectura con CRC corrupto", SLAVE_ID1, err))
+                {
+                    printf(">> COMPORTAMIENTO VERIFICADO: El esclavo ignoro la trama y el maestro dio Timeout.\n");
+                }
+                break;
+            }
+
+            case 'o':
+            case 'O':
+            {
+                printf("\n>> [TEST] Enviando lectura con CRC corrupto al Esclavo 2...\n");
+                
+                uint8_t req_corrupto[8] = {
+                    SLAVE_ID2,                    // ID esclavo (2)
+                    FC_READ_HOLDING_REGISTERS,    // Función 0x03
+                    0x00, 0x00,                   // Registro inicial 0
+                    0x00, 0x01,                   // Cantidad 1
+                    0x00, 0x00                    // CRC erróneo forzado
+                };
+                
+                modbus_frame_t resp;
+                
+                // modbus_transaccion envía por RS-485 y espera hasta RESPUESTA_TIMEOUT_MS (500 ms)
+                esp_err_t err = modbus_transaccion(req_corrupto, sizeof(req_corrupto), &resp);
+                
+                // mb_check evalúa el error e imprime el mensaje correspondiente
+                if (!mb_check("Lectura con CRC corrupto", SLAVE_ID2, err))
+                {
+                    printf(">> COMPORTAMIENTO VERIFICADO: El esclavo ignoro la trama y el maestro dio Timeout.\n");
+                }
+                break;
+            }
+
+            case 'm':
+            case 'M': break;                    // solo vuelve a mostrar el menú
+
+            default:
+                printf(">> Opcion '%c' no valida\n", c);
+                break;
+        }
+
+        mostrar_menu();                         // el menú siempre queda a la vista
     }
 }
 
@@ -554,7 +812,15 @@ void app_main(void)
         return;
     }
 
+    bus_mutex = xSemaphoreCreateMutex();
+    if (bus_mutex == NULL)
+    {
+        ESP_LOGE(TAG, "Error creando el mutex del bus");
+        return;
+    }
+
     // Mayor prioridad en la recepción para no perder bytes
     xTaskCreate(uart_rx_task,       "uart_rx_task",       4096, NULL, 6, NULL);
     xTaskCreate(modbus_master_task, "modbus_master_task", 6144, NULL, 5, NULL);
+    xTaskCreate(consola_menu_task,  "consola_menu_task",  6144, NULL, 4, NULL);
 }
